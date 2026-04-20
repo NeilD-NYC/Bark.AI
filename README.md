@@ -12,6 +12,9 @@ Patrols a residential property perimeter autonomously, detects
 intruders via AI vision, and executes a deterrent response -- 
 all on a 24-hour battery cycle without human intervention.
 
+![Bark.AI parts layout](docs/build_photo.jpg)
+![Architecture schematic](docs/architecture.svg)
+
 ## Architecture
 
 [Hailo NPU] --> [Raspberry Pi 5] --> [ESP32] --> [2x BLDC Hub Motors]
