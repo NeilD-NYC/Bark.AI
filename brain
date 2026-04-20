@@ -1,0 +1,354 @@
+// ============================================================
+// ESP32 Autonomous Rover Controller
+// 4WD Property Patrol System with AI Integration
+// Interfaces with Raspberry Pi 5 + Hailo NPU via Serial
+// Controls dual motor pairs via L298N/VNH5019 drivers
+// Encoder feedback for closed-loop PID speed control
+// ============================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <PID_v1.h>
+
+// ============================================================
+// PIN DEFINITIONS
+// ============================================================
+
+// Communication with Raspberry Pi 5 (via Serial2)
+#define RPI_DATA_PIN        2   // Data/handshake signal from RPi5
+#define NPU_DATA_PIN        4   // Data/handshake signal from Hailo NPU
+
+// Basic DC Motor (front pair, L298N style)
+#define MOTOR_FRONT_IN1     5
+#define MOTOR_FRONT_IN2     18
+#define MOTOR_FRONT_EN      19  // PWM enable
+
+// Chassis / Rover data line
+#define CHASSIS_DATA_PIN    13
+
+// Encoder motor data pins (generic)
+#define MOTOR_LEFT_DATA     14
+#define MOTOR_RIGHT_DATA    16
+
+// Pololu 37D Motor #6 (Rear-Left) - with VNH5019 driver
+#define ENC_A_M6            3   // Encoder Channel A (Yellow)
+#define ENC_B_M6            0   // Encoder Channel B (White) - BOOT PIN, use carefully
+#define PWM_M6              17  // Motor PWM speed
+#define DIR_A_M6            21  // Direction A
+#define DIR_B_M6            22  // Direction B
+#define CS_M6               25  // Current sense (analog)
+
+// Pololu 37D Motor #7 (Rear-Right) - with L298N driver
+#define ENC_A_M7            23  // Encoder Channel A (Yellow)
+#define ENC_B_M7            26  // Encoder Channel B (White)
+#define MOTOR_M7_IN1        27  // Motor Driver IN1 / PWM
+#define MOTOR_M7_IN2        32  // Motor Driver IN2 / DIR
+
+// ============================================================
+// PWM CHANNEL DEFINITIONS (ESP32 LEDC)
+// ============================================================
+#define PWM_CH_FRONT        0   // LEDC channel for front motor EN
+#define PWM_CH_M6           1   // LEDC channel for motor 6 PWM
+#define PWM_CH_M7           2   // LEDC channel for motor 7 PWM
+#define PWM_FREQ            10000
+#define PWM_RESOLUTION      8   // 8-bit = 0-255
+
+// ============================================================
+// SERIAL COMMUNICATION
+// ============================================================
+// Serial  (USB)    -> Debug
+// Serial1          -> Raspberry Pi 5 communication
+// Serial2          -> Additional peripheral if needed
+#define RPI_SERIAL          Serial1
+#define RPI_SERIAL_TX       1   // GPIO1 (USB TX, shared - use alternate)
+#define RPI_SERIAL_RX       3   // GPIO3 (USB RX, shared - use alternate)
+// We'll use Serial2 for RPi communication on different pins
+#define RPI_TX_PIN          17  // Note: conflicts with PWM_M6 - managed via state
+// Use hardware UART via Serial2 with remapped pins
+// TX2=GPIO17 conflicts - we handle RPi comms via shared Serial1 at startup
+
+// ============================================================
+// ROVER STATE MACHINE
+// ============================================================
+enum RoverState {
+    STATE_IDLE,
+    STATE_PATROL,
+    STATE_INVESTIGATE,
+    STATE_ALERT,
+    STATE_DETER,
+    STATE_RETURN_HOME,
+    STATE_LOW_BATTERY,
+    STATE_CHARGING,
+    STATE_OBSTACLE_AVOID,
+    STATE_EMERGENCY_STOP
+};
+
+// ============================================================
+// MOTION COMMANDS from RPi
+// ============================================================
+enum MotionCmd {
+    CMD_STOP,
+    CMD_FORWARD,
+    CMD_BACKWARD,
+    CMD_TURN_LEFT,
+    CMD_TURN_RIGHT,
+    CMD_SPIN_LEFT,
+    CMD_SPIN_RIGHT,
+    CMD_CUSTOM
+};
+
+// ============================================================
+// ENCODER TRACKING (volatile for ISR)
+// ============================================================
+volatile long enc_count_m6 = 0;
+volatile long enc_count_m7 = 0;
+volatile int  enc_dir_m6   = 0;
+volatile int  enc_dir_m7   = 0;
+
+// PID variables for Motor 6
+double pid_m6_setpoint = 0.0;
+double pid_m6_input    = 0.0;
+double pid_m6_output   = 0.0;
+double Kp_m6 = 2.0, Ki_m6 = 0.5, Kd_m6 = 0.1;
+PID pid_motor6(&pid_m6_input, &pid_m6_output, &pid_m6_setpoint, Kp_m6, Ki_m6, Kd_m6, DIRECT);
+
+// PID variables for Motor 7
+double pid_m7_setpoint = 0.0;
+double pid_m7_input    = 0.0;
+double pid_m7_output   = 0.0;
+double Kp_m7 = 2.0, Ki_m7 = 0.5, Kd_m7 = 0.1;
+PID pid_motor7(&pid_m7_input, &pid_m7_output, &pid_m7_setpoint, Kp_m7, Ki_m7, Kd_m7, DIRECT);
+
+// ============================================================
+// ROVER CONFIGURATION
+// ============================================================
+struct RoverConfig {
+    float patrol_speed       = 0.5f;  // 0.0-1.0
+    float max_speed          = 1.0f;
+    float turn_speed         = 0.4f;
+    float battery_low_thresh = 20.0f; // %
+    float battery_crit_thresh= 10.0f; // %
+    bool  night_mode         = false;
+    bool  audio_deter_enabled= true;
+    bool  pid_enabled        = true;
+    unsigned long patrol_segment_ms = 5000;  // ms between waypoint checks
+};
+
+// ============================================================
+// ROVER TELEMETRY
+// ============================================================
+struct RoverTelemetry {
+    float battery_percent    = 100.0f;
+    float motor6_current_mA  = 0.0f;
+    float motor7_current_mA  = 0.0f;
+    long  encoder_m6         = 0;
+    long  encoder_m7         = 0;
+    float speed_rpm_m6       = 0.0f;
+    float speed_rpm_m7       = 0.0f;
+    RoverState state         = STATE_IDLE;
+    MotionCmd  current_cmd   = CMD_STOP;
+    bool  obstacle_detected  = false;
+    bool  intruder_detected  = false;
+    String detection_class   = "";
+    float detection_confidence = 0.0f;
+    unsigned long last_detection_time = 0;
+    int   alert_level        = 0;  // 0=none, 1=low, 2=med, 3=high
+    unsigned long uptime_ms  = 0;
+};
+
+// ============================================================
+// GLOBAL OBJECTS
+// ============================================================
+RoverConfig    roverConfig;
+RoverTelemetry telemetry;
+WebServer      httpServer(80);
+
+// Timing
+unsigned long lastPIDUpdate       = 0;
+unsigned long lastTelemetryUpdate = 0;
+unsigned long lastRPiMessage      = 0;
+unsigned long lastStateChange     = 0;
+unsigned long lastEncoderRead     = 0;
+unsigned long patrolTimer         = 0;
+unsigned long deterTimer          = 0;
+unsigned long alertTimer          = 0;
+
+// Encoder RPM tracking
+long last_enc_m6 = 0;
+long last_enc_m7 = 0;
+
+// RPi communication buffer
+String rpiBuffer = "";
+const int RPI_MSG_MAX = 512;
+
+// Motor speed targets (-255 to 255)
+int target_speed_m6 = 0;
+int target_speed_m7 = 0;
+int actual_speed_m6 = 0;
+int actual_speed_m7 = 0;
+
+// Front motor pair speed
+int front_motor_speed = 0;
+
+// Obstacle avoidance
+unsigned long obstacleAvoidStart = 0;
+int avoidPhase = 0;
+
+// Deter behavior
+unsigned long deterStartTime  = 0;
+int deterPhase = 0;
+
+// ============================================================
+// ENCODER INTERRUPT SERVICE ROUTINES
+// ============================================================
+void IRAM_ATTR enc_m6_A_ISR() {
+    bool a = digitalRead(ENC_A_M6);
+    bool b = digitalRead(ENC_B_M6);
+    if (a == b) enc_count_m6++;
+    else        enc_count_m6--;
+}
+
+void IRAM_ATTR enc_m7_A_ISR() {
+    bool a = digitalRead(ENC_A_M7);
+    bool b = digitalRead(ENC_B_M7);
+    if (a == b) enc_count_m7++;
+    else        enc_count_m7--;
+}
+
+// ============================================================
+// MOTOR CONTROL FUNCTIONS
+// ============================================================
+
+// Front motor pair (L298N simple control)
+void setFrontMotors(int speed) {
+    // speed: -255 to 255
+    front_motor_speed = constrain(speed, -255, 255);
+    if (front_motor_speed > 0) {
+        digitalWrite(MOTOR_FRONT_IN1, HIGH);
+        digitalWrite(MOTOR_FRONT_IN2, LOW);
+        ledcWrite(PWM_CH_FRONT, front_motor_speed);
+    } else if (front_motor_speed < 0) {
+        digitalWrite(MOTOR_FRONT_IN1, LOW);
+        digitalWrite(MOTOR_FRONT_IN2, HIGH);
+        ledcWrite(PWM_CH_FRONT, -front_motor_speed);
+    } else {
+        digitalWrite(MOTOR_FRONT_IN1, LOW);
+        digitalWrite(MOTOR_FRONT_IN2, LOW);
+        ledcWrite(PWM_CH_FRONT, 0);
+    }
+}
+
+// Motor 6 (Pololu 37D, VNH5019 style)
+void setMotor6(int speed) {
+    speed = constrain(speed, -255, 255);
+    actual_speed_m6 = speed;
+    if (speed > 0) {
+        digitalWrite(DIR_A_M6, HIGH);
+        digitalWrite(DIR_B_M6, LOW);
+        ledcWrite(PWM_CH_M6, speed);
+    } else if (speed < 0) {
+        digitalWrite(DIR_A_M6, LOW);
+        digitalWrite(DIR_B_M6, HIGH);
+        ledcWrite(PWM_CH_M6, -speed);
+    } else {
+        digitalWrite(DIR_A_M6, LOW);
+        digitalWrite(DIR_B_M6, LOW);
+        ledcWrite(PWM_CH_M6, 0);
+    }
+}
+
+// Motor 7 (Pololu 37D, L298N style)
+void setMotor7(int speed) {
+    speed = constrain(speed, -255, 255);
+    actual_speed_m7 = speed;
+    if (speed > 0) {
+        digitalWrite(MOTOR_M7_IN1, HIGH);
+        digitalWrite(MOTOR_M7_IN2, LOW);
+        ledcWrite(PWM_CH_M7, speed);
+    } else if (speed < 0) {
+        digitalWrite(MOTOR_M7_IN1, LOW);
+        digitalWrite(MOTOR_M7_IN2, HIGH);
+        ledcWrite(PWM_CH_M7, -speed);
+    } else {
+        digitalWrite(MOTOR_M7_IN1, LOW);
+        digitalWrite(MOTOR_M7_IN2, LOW);
+        ledcWrite(PWM_CH_M7, 0);
+    }
+}
+
+// All motors stop
+void stopAllMotors() {
+    setFrontMotors(0);
+    setMotor6(0);
+    setMotor7(0);
+    target_speed_m6 = 0;
+    target_speed_m7 = 0;
+}
+
+// Drive all four wheels
+void driveRover(int leftSpeed, int rightSpeed) {
+    // leftSpeed / rightSpeed: -255 to 255
+    // Front motors mirror rear
+    int avgSpeed = (leftSpeed + rightSpeed) / 2;
+    setFrontMotors(avgSpeed);  // Front pair as average (or split if wired separately)
+    setMotor6(leftSpeed);      // Rear-left
+    setMotor7(rightSpeed);     // Rear-right
+
+    target_speed_m6 = leftSpeed;
+    target_speed_m7 = rightSpeed;
+}
+
+// High-level motion commands
+void moveForward(float speedFactor = 1.0f) {
+    int spd = (int)(255.0f * constrain(speedFactor, 0.0f, 1.0f));
+    driveRover(spd, spd);
+    telemetry.current_cmd = CMD_FORWARD;
+}
+
+void moveBackward(float speedFactor = 1.0f) {
+    int spd = (int)(255.0f * constrain(speedFactor, 0.0f, 1.0f));
+    driveRover(-spd, -spd);
+    telemetry.current_cmd = CMD_BACKWARD;
+}
+
+void turnLeft(float speedFactor = 1.0f) {
+    // Differential: right faster, left slower
+    int spd = (int)(255.0f * constrain(speedFactor, 0.0f, 1.0f));
+    driveRover(spd / 2, spd);
+    telemetry.current_cmd = CMD_TURN_LEFT;
+}
+
+void turnRight(float speedFactor = 1.0f) {
+    int spd = (int)(255.0f * constrain(speedFactor, 0.0f, 1.0f));
+    driveRover(spd, spd / 2);
+    telemetry.current_cmd = CMD_TURN_RIGHT;
+}
+
+void spinLeft(float speedFactor = 1.0f) {
+    int spd = (int)(255.0f * constrain(speedFactor, 0.0f, 1.0f));
+    driveRover(-spd, spd);
+    telemetry.current_cmd = CMD_SPIN_LEFT;
+}
+
+void spinRight(float speedFactor = 1.0f) {
+    int spd = (int)(255.0f * constrain(speedFactor, 0.0f, 1.0f));
+    driveRover(spd, -spd);
+    telemetry.current_cmd = CMD_SPIN_RIGHT;
+}
+
+// ============================================================
+// PID UPDATE
+// ============================================================
+void updatePID() {
+    unsigned long now = millis();
+    float dt = (now - lastEncoderRead) / 1000.0f;
+    if (dt < 0.05f) return;  // Update at max 20Hz
+    lastEncoderRead = now;
+
+    // Capture encoder counts atomically
+    long cur_m6, cur_m7;
+    noInterrupts();
+    cur_m6 = enc_count_m6;
+    cur_m7 = enc_count_m
