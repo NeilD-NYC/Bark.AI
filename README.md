@@ -12,8 +12,7 @@ Patrols a residential property perimeter autonomously, detects
 intruders via AI vision, and executes a deterrent response -- 
 all on a 24-hour battery cycle without human intervention.
 
-![Bark.AI parts layout](docs/build_photo.jpg)
-![Architecture schematic](docs/architecture.svg)
+![Bark.AI top-down schematic](bark_ai_rover_schematic.svg)
 
 ## Architecture
 
@@ -55,3 +54,7 @@ Battery watchdog triggers `RETURN_HOME` at 25%, `EMERGENCY_STOP` at 10%.
 ## Why I Built This
 Wanted a real-world platform to learn edge AI, embedded systems 
 and autonomous robotics without spending $5,000 on a research robot.
+
+---
+
+Built by [Neil Datta](https://datta.si) · [More projects](https://datta.si/#work)
